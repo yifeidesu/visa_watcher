@@ -1,0 +1,17 @@
+{
+  "name": "visa_watcher",
+  "version": "1.0.0",
+  "description": "Japan visa slot watcher for Toronto RSV system with Telegram alerts",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "check": "node --check src/index.js"
+  },
+  "keywords": [
+    "visa",
+    "watcher",
+    "telegram"
+  ],
+  "license": "MIT"
+}
