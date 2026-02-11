@@ -1,6 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
+const parsedPlanIds = parseCsvInts(process.env.PLAN_IDS || '');
+
 const config = {
   calendarUrl:
     process.env.CALENDAR_URL || 'https://toronto.rsvsys.jp/reservations/calendar',
@@ -13,7 +15,7 @@ const config = {
   pollIntervalMs: toPositiveInt(process.env.POLL_INTERVAL_MS, 45000),
   requestTimeoutMs: toPositiveInt(process.env.REQUEST_TIMEOUT_MS, 20000),
   monthsAhead: toPositiveInt(process.env.MONTHS_AHEAD, 1),
-  planIds: parseCsvInts(process.env.PLAN_IDS || ''),
+  planIds: parsedPlanIds.length > 0 ? parsedPlanIds : [20],
   dryRun: String(process.env.DRY_RUN || '').toLowerCase() === 'true',
   sendStartupNotice:
     String(process.env.SEND_STARTUP_NOTICE || '').toLowerCase() !== 'false',
@@ -428,18 +430,14 @@ function extractHtmlFromCalendarResponse(body) {
 }
 
 function selectTargetPlans(allPlans) {
-  if (config.planIds.length > 0) {
-    const wanted = new Set(config.planIds);
-    const fromPage = allPlans.filter((plan) => wanted.has(plan.id));
-    if (fromPage.length > 0) {
-      return fromPage;
-    }
-    // Fallback: if page parsing fails, still allow explicit PLAN_IDS to drive checks.
-    return config.planIds.map((id) => ({ id, label: `Plan ${id}` }));
+  const wanted = new Set(config.planIds);
+  const fromPage = allPlans.filter((plan) => wanted.has(plan.id));
+  if (fromPage.length > 0) {
+    return fromPage;
   }
 
-  // No PLAN_IDS provided: check all plans returned by server.
-  return allPlans;
+  // Fallback: if page parsing fails, still allow configured PLAN_IDS to drive checks.
+  return config.planIds.map((id) => ({ id, label: `Plan ${id}` }));
 }
 
 function buildAlertText(foundSlots) {
@@ -533,6 +531,8 @@ function buildStartupTestText() {
   return [
     'Visa watcher started',
     `Time: ${nowIso()}`,
+    `Event ID: ${config.eventId}`,
+    `Plan IDs: ${config.planIds.join(',')}`,
     `URL: ${config.calendarUrl}`,
   ].join('\n');
 }
@@ -554,23 +554,6 @@ async function checkOnce(state) {
     allPlans.push({ id: selectedPlanId, label: `Plan ${selectedPlanId}` });
   }
 
-  // If PLAN_IDS is not set, do an initial request without `plan` to discover all plans
-  // currently available in this event/date context.
-  if (config.planIds.length === 0) {
-    const seedDate = new Date();
-    const seedHtml = await fetchCalendarByPlan({
-      cookie,
-      csrfToken,
-      tokenFields,
-      tokenUnlocked,
-      planId: undefined,
-      date: seedDate,
-    });
-    const discoveredPlans = parsePlans(seedHtml);
-    if (discoveredPlans.length > 0) {
-      allPlans = dedupePlans(discoveredPlans);
-    }
-  }
   const targetPlans = selectTargetPlans(allPlans);
 
   if (targetPlans.length === 0) {
