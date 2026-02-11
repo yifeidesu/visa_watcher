@@ -1,4 +1,4 @@
 node_modules
 .env
 .watcher-state.json
-env.example
+.env.example

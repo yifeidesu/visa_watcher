@@ -7,6 +7,7 @@ const config = {
   calendarAjaxUrl:
     process.env.CALENDAR_AJAX_URL ||
     'https://toronto.rsvsys.jp/ajax/reservations/calendar',
+  eventId: toPositiveInt(process.env.EVENT_ID, 16),
   telegramBotToken: process.env.TELEGRAM_BOT_TOKEN || '',
   telegramChatId: process.env.TELEGRAM_CHAT_ID || '',
   pollIntervalMs: toPositiveInt(process.env.POLL_INTERVAL_MS, 45000),
@@ -14,12 +15,28 @@ const config = {
   monthsAhead: toPositiveInt(process.env.MONTHS_AHEAD, 1),
   planIds: parseCsvInts(process.env.PLAN_IDS || ''),
   dryRun: String(process.env.DRY_RUN || '').toLowerCase() === 'true',
+  sendStartupNotice:
+    String(process.env.SEND_STARTUP_NOTICE || '').toLowerCase() !== 'false',
+  debugCalendarResponse:
+    String(process.env.DEBUG_CALENDAR_RESPONSE || '').toLowerCase() === 'true',
+  debugCalendarResponseMaxChars: toNonNegativeInt(
+    process.env.DEBUG_CALENDAR_RESPONSE_MAX_CHARS,
+    3000
+  ),
   stateFile: process.env.STATE_FILE || '.watcher-state.json',
 };
 
 function toPositiveInt(value, fallback) {
   const n = Number(value);
   if (!Number.isFinite(n) || n <= 0) {
+    return fallback;
+  }
+  return Math.floor(n);
+}
+
+function toNonNegativeInt(value, fallback) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0) {
     return fallback;
   }
   return Math.floor(n);
@@ -151,12 +168,32 @@ function parseAvailableDates(html, fallbackDate) {
   while ((tdMatch = tdRegex.exec(html)) !== null) {
     const cell = tdMatch[1];
 
+    // In this calendar, icon_circle.svg indicates a selectable/available slot date.
+    if (/icon_circle\.svg/i.test(cell)) {
+      const dateMatches = [...cell.matchAll(/data-date=["'](\d{4}\/\d{2}\/\d{2})["']/gi)];
+      if (dateMatches.length > 0) {
+        for (const m of dateMatches) {
+          const iso = rsvDateToIso(m[1]);
+          if (iso) {
+            dates.push(iso);
+          }
+        }
+        continue;
+      }
+    }
+
+    // icon_disabled.svg cells should be treated as unavailable.
+    if (/icon_disabled\.svg/i.test(cell)) {
+      continue;
+    }
+
+    // Fallback for other variants where availability is encoded in alt text.
     if (!/Available/i.test(cell) && !/受付中/.test(cell)) {
       continue;
     }
 
     const dayMatch = cell.match(
-      /<div class=["']sc_cal_date(?:[^"']*)["']>(\d{1,2})<\/div>/i
+      /<div class=["']sc_cal_date(?:[^"']*)["']>\s*(?:<a[^>]*>)?(\d{1,2})(?:<\/a>)?\s*<\/div>/i
     );
     if (!dayMatch) {
       continue;
@@ -171,6 +208,12 @@ function parseAvailableDates(html, fallbackDate) {
   }
 
   return [...new Set(dates)].sort();
+}
+
+function rsvDateToIso(raw) {
+  const m = raw.match(/^(\d{4})\/(\d{2})\/(\d{2})$/);
+  if (!m) return '';
+  return `${m[1]}-${m[2]}-${m[3]}`;
 }
 
 function toIsoDate(year, month, day) {
@@ -253,14 +296,82 @@ function buildCookieHeader(response) {
     .join('; ');
 }
 
-async function fetchCalendarByPlan({ cookie, csrfToken, tokenFields, tokenUnlocked, eventId, planId, date }) {
+function mergeCookieHeaders(existingCookie, newCookie) {
+  const map = new Map();
+  for (const part of `${existingCookie || ''}; ${newCookie || ''}`.split(';')) {
+    const trimmed = part.trim();
+    if (!trimmed) continue;
+    const eq = trimmed.indexOf('=');
+    if (eq <= 0) continue;
+    const k = trimmed.slice(0, eq).trim();
+    const v = trimmed.slice(eq + 1).trim();
+    map.set(k, v);
+  }
+  return [...map.entries()].map(([k, v]) => `${k}=${v}`).join('; ');
+}
+
+async function selectVisaCategoryContext({ cookie, initialHtml }) {
+  const csrfToken = extractInputValue(initialHtml, '_csrfToken');
   const params = new URLSearchParams();
   params.set('_method', 'POST');
   if (csrfToken) params.set('_csrfToken', csrfToken);
-  params.set('event', String(eventId));
-  params.set('plan', String(planId));
+  params.set('category', '');
+  params.set('event', String(config.eventId));
+  params.set('search', 'exec');
+
+  const tryUrls = [config.calendarAjaxUrl, config.calendarUrl];
+  let lastError = null;
+
+  for (const url of tryUrls) {
+    const response = await fetchWithTimeout(
+      url,
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/x-www-form-urlencoded; charset=UTF-8',
+          accept: 'text/html, */*; q=0.01',
+          'x-requested-with': 'XMLHttpRequest',
+          origin: new URL(config.calendarUrl).origin,
+          referer: config.calendarUrl,
+          ...(cookie ? { cookie } : {}),
+          'user-agent': 'Mozilla/5.0 (visa-slot-watcher)',
+        },
+        body: params.toString(),
+      },
+      config.requestTimeoutMs
+    );
+
+    const body = await response.text();
+    if (!response.ok) {
+      const preview = body.slice(0, 300);
+      lastError = new Error(
+        `category select POST failed via ${url}: ${response.status} body=${preview}`
+      );
+      continue;
+    }
+
+    const html = extractHtmlFromCalendarResponse(body);
+    const newCookie = buildCookieHeader(response);
+    return {
+      html,
+      cookie: mergeCookieHeaders(cookie, newCookie),
+    };
+  }
+
+  throw lastError || new Error('category select POST failed');
+}
+
+async function fetchCalendarByPlan({ cookie, csrfToken, tokenFields, tokenUnlocked, planId, date }) {
+  const params = new URLSearchParams();
+  params.set('_method', 'POST');
+  if (csrfToken) params.set('_csrfToken', csrfToken);
+  params.set('event', String(config.eventId));
+  if (Number.isInteger(planId) && planId > 0) {
+    params.set('plan', String(planId));
+  }
   params.set('date', formatRsvDate(date));
   params.set('disp_type', 'month');
+  params.set('search', 'exec');
   if (tokenFields) params.set('_Token[fields]', tokenFields);
   params.set('_Token[unlocked]', tokenUnlocked || '');
 
@@ -278,29 +389,65 @@ async function fetchCalendarByPlan({ cookie, csrfToken, tokenFields, tokenUnlock
     body: params.toString(),
   }, config.requestTimeoutMs);
 
+  const body = await response.text();
+
+  if (config.debugCalendarResponse) {
+    const preview =
+      config.debugCalendarResponseMaxChars === 0
+        ? body
+        : body.slice(0, config.debugCalendarResponseMaxChars);
+    console.log(
+      `[${nowIso()}] calendar api debug plan=${planId} date=${formatRsvDate(date)} status=${response.status} body:\n${preview}`
+    );
+  }
+
   if (!response.ok) {
     throw new Error(`calendar POST failed for plan ${planId}: ${response.status}`);
   }
 
-  return await response.text();
+  const html = extractHtmlFromCalendarResponse(body);
+  return html;
+}
+
+function extractHtmlFromCalendarResponse(body) {
+  const trimmed = body.trim();
+  if (!trimmed.startsWith('{')) {
+    return body;
+  }
+
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (parsed && typeof parsed.html === 'string') {
+      return parsed.html;
+    }
+  } catch (_error) {
+    // Fall back to raw body if response is not valid JSON.
+  }
+
+  return body;
 }
 
 function selectTargetPlans(allPlans) {
   if (config.planIds.length > 0) {
     const wanted = new Set(config.planIds);
-    return allPlans.filter((plan) => wanted.has(plan.id));
+    const fromPage = allPlans.filter((plan) => wanted.has(plan.id));
+    if (fromPage.length > 0) {
+      return fromPage;
+    }
+    // Fallback: if page parsing fails, still allow explicit PLAN_IDS to drive checks.
+    return config.planIds.map((id) => ({ id, label: `Plan ${id}` }));
   }
 
-  const visaPlans = allPlans.filter((plan) => /visa/i.test(plan.label));
-  return visaPlans.length > 0 ? visaPlans : allPlans;
+  // No PLAN_IDS provided: check all plans returned by server.
+  return allPlans;
 }
 
-function buildAlertText(newMatches) {
+function buildAlertText(foundSlots) {
   const lines = [];
   lines.push('Japan visa slot available');
   lines.push('');
 
-  for (const match of newMatches) {
+  for (const match of foundSlots) {
     lines.push(`Plan: ${match.planLabel} (ID: ${match.planId})`);
     lines.push(`Date: ${match.date}`);
     lines.push('');
@@ -322,23 +469,64 @@ async function sendTelegramMessage(text) {
   }
 
   const url = `https://api.telegram.org/bot${config.telegramBotToken}/sendMessage`;
+  const chunks = splitForTelegram(text, 3900);
 
-  const response = await fetchWithTimeout(url, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-    },
-    body: JSON.stringify({
-      chat_id: config.telegramChatId,
-      text,
-      disable_web_page_preview: true,
-    }),
-  }, config.requestTimeoutMs);
+  for (const chunk of chunks) {
+    const response = await fetchWithTimeout(url, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        chat_id: config.telegramChatId,
+        text: chunk,
+        disable_web_page_preview: true,
+      }),
+    }, config.requestTimeoutMs);
 
-  if (!response.ok) {
-    const body = await response.text();
-    throw new Error(`telegram send failed: ${response.status} ${body}`);
+    if (!response.ok) {
+      const body = await response.text();
+      throw new Error(`telegram send failed: ${response.status} ${body}`);
+    }
   }
+}
+
+function splitForTelegram(text, maxLen) {
+  if (text.length <= maxLen) {
+    return [text];
+  }
+
+  const chunks = [];
+  let current = '';
+  for (const line of text.split('\n')) {
+    const candidate = current ? `${current}\n${line}` : line;
+    if (candidate.length <= maxLen) {
+      current = candidate;
+      continue;
+    }
+
+    if (current) {
+      chunks.push(current);
+      current = '';
+    }
+
+    if (line.length <= maxLen) {
+      current = line;
+      continue;
+    }
+
+    let rest = line;
+    while (rest.length > maxLen) {
+      chunks.push(rest.slice(0, maxLen));
+      rest = rest.slice(maxLen);
+    }
+    current = rest;
+  }
+
+  if (current) {
+    chunks.push(current);
+  }
+  return chunks;
 }
 
 function buildStartupTestText() {
@@ -350,16 +538,38 @@ function buildStartupTestText() {
 }
 
 async function checkOnce(state) {
-  const { html: initialHtml, cookie } = await getSessionAndInitialHtml();
-  const csrfToken = extractInputValue(initialHtml, '_csrfToken');
-  const tokenFields = extractInputValue(initialHtml, '_Token[fields]');
-  const tokenUnlocked = extractInputValue(initialHtml, '_Token[unlocked]');
-  const eventId = Number(parseSelectedValue(initialHtml, 'event') || 16);
-  const selectedPlanId = Number(parseSelectedValue(initialHtml, 'plan'));
+  const { html: initialHtml, cookie: initialCookie } = await getSessionAndInitialHtml();
+  const { html: visaContextHtml, cookie } = await selectVisaCategoryContext({
+    cookie: initialCookie,
+    initialHtml,
+  });
 
-  const allPlans = parsePlans(initialHtml);
+  const csrfToken = extractInputValue(visaContextHtml, '_csrfToken');
+  const tokenFields = extractInputValue(visaContextHtml, '_Token[fields]');
+  const tokenUnlocked = extractInputValue(visaContextHtml, '_Token[unlocked]');
+  const selectedPlanId = Number(parseSelectedValue(visaContextHtml, 'plan'));
+
+  let allPlans = parsePlans(visaContextHtml);
   if (allPlans.length === 0 && Number.isInteger(selectedPlanId) && selectedPlanId > 0) {
     allPlans.push({ id: selectedPlanId, label: `Plan ${selectedPlanId}` });
+  }
+
+  // If PLAN_IDS is not set, do an initial request without `plan` to discover all plans
+  // currently available in this event/date context.
+  if (config.planIds.length === 0) {
+    const seedDate = new Date();
+    const seedHtml = await fetchCalendarByPlan({
+      cookie,
+      csrfToken,
+      tokenFields,
+      tokenUnlocked,
+      planId: undefined,
+      date: seedDate,
+    });
+    const discoveredPlans = parsePlans(seedHtml);
+    if (discoveredPlans.length > 0) {
+      allPlans = dedupePlans(discoveredPlans);
+    }
   }
   const targetPlans = selectTargetPlans(allPlans);
 
@@ -381,7 +591,6 @@ async function checkOnce(state) {
         csrfToken,
         tokenFields,
         tokenUnlocked,
-        eventId,
         planId: plan.id,
         date,
       });
@@ -399,22 +608,27 @@ async function checkOnce(state) {
     }
   }
 
-  const newMatches = [];
-  for (const slot of found) {
-    if (!state.seen[slot.key]) {
-      state.seen[slot.key] = nowIso();
-      newMatches.push(slot);
-    }
-  }
-
-  if (newMatches.length > 0) {
-    const text = buildAlertText(newMatches);
+  const uniqueFound = dedupeFoundSlots(found);
+  if (uniqueFound.length > 0) {
+    const text = buildAlertText(uniqueFound);
     await sendTelegramMessage(text);
-    console.log(`[${nowIso()}] sent alert for ${newMatches.length} new slot(s)`);
-    saveState(config.stateFile, state);
+    console.log(`[${nowIso()}] sent alert for ${uniqueFound.length} available slot(s)`);
   } else {
     console.log(`[${nowIso()}] no new slots`);
   }
+}
+
+function dedupeFoundSlots(slots) {
+  const byKey = new Map();
+  for (const slot of slots) {
+    if (!byKey.has(slot.key)) {
+      byKey.set(slot.key, slot);
+    }
+  }
+  return [...byKey.values()].sort((a, b) => {
+    if (a.date !== b.date) return a.date.localeCompare(b.date);
+    return a.planId - b.planId;
+  });
 }
 
 async function main() {
@@ -429,11 +643,15 @@ async function main() {
 
   const state = loadState(config.stateFile);
 
-  try {
-    await sendTelegramMessage(buildStartupTestText());
-    console.log(`[${nowIso()}] startup telegram notice sent`);
-  } catch (error) {
-    console.error(`[${nowIso()}] startup telegram notice failed: ${error.message}`);
+  if (config.sendStartupNotice) {
+    try {
+      await sendTelegramMessage(buildStartupTestText());
+      console.log(`[${nowIso()}] startup telegram notice sent`);
+    } catch (error) {
+      console.error(`[${nowIso()}] startup telegram notice failed: ${error.message}`);
+    }
+  } else {
+    console.log(`[${nowIso()}] startup telegram notice disabled`);
   }
 
   while (true) {
